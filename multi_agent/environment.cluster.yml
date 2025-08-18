@@ -1,0 +1,26 @@
+name: pet
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  # Choose one of the following GPU stacks depending on cluster drivers
+  # For CUDA 11.8+ drivers, prefer this combo:
+  - pytorch=2.1.*
+  - torchvision=0.16.*
+  - torchaudio=2.1.*
+  - pytorch-cuda=11.8
+  # If your cluster only supports CUDA 11.7, switch to:
+  # - pytorch=2.0.1
+  # - torchvision=0.15.2
+  # - torchaudio=2.0.2
+  # - pytorch-cuda=11.7
+  - numpy=1.25
+  - pandas=2.0
+  - scipy=1.11
+  - matplotlib=3.7
+  - pip:
+      - -r requirements-train.txt
