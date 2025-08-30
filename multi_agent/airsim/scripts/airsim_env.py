@@ -70,7 +70,7 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         # self.done = None  # old
         self.terminations = None  # new ParallelEnv API
         self.obj = None
-        self.max_steps = 350  # moderate episode length
+        self.max_steps = 200  # reduced from 250 since drones will move faster now
         self.current_step = None
 
         # Observation space - FIXED for PettingZoo compatibility
@@ -144,30 +144,38 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
                 }
             )
         
-        # Control and comm parameters
-        self.control_dt = 0.25  # command duration per step
-        self.max_xy_speed = 5.0  # increase horizontal motion speed
-        self.max_z_speed = 0.30   # modest vertical motion
-        self.max_yaw_rate_deg = 15.0  # gentler turning to avoid spin-in-place
-        self.smooth_alpha = 0.10  # increase responsiveness per step
+        # Control and comm parameters - OPTIMIZED for actual movement
+        self.control_dt = 1.7  # reduced from 3.0 to reduce spiral arcs per step
+        self.max_xy_speed = 8.0  # increased from 5.0 for faster horizontal motion
+        self.max_z_speed = 1.0   # increased from 0.30 for faster vertical motion
+        self.max_yaw_rate_deg = 6.0  # lower yaw authority to reduce spirals
+        self.smooth_alpha = 0.3  # base action smoothing factor (overridden per-episode)
         # Warmup scheduling for smoothing (reduce at start to encourage visible motion)
         self._episode_index = 0
-        self._smooth_warmup_episodes = 3
-        self._smooth_warmup_value = 0.02
+        self._smooth_warmup_episodes = 2  # reduced from 3
+        self._smooth_warmup_value = 0.1  # increased from 0.02
         self._last_action = {i: np.zeros(4, dtype=np.float32) for i in self.possible_agents}
+        # Remove extra velocity low-pass; rely on action smoothing only
+        self._prev_cmd_v = {i: np.zeros(3, dtype=np.float32) for i in self.possible_agents}
 
-        # Reward shaping and safety tuning
+        # Reward shaping and safety tuning - OPTIMIZED for stable learning
         self.gamma = 0.99  # discount used for potential-based shaping
-        self.shaping_k = 5.0  # stronger distance-progress shaping
-        self.vertical_shaping_k = 0.5  # modest altitude shaping
-        self.time_penalty = 0.007  # gentle time pressure when far
-        self.soft_wall_scale = 0.2  # much softer wall penalty
-        self.soft_wall_radius = 8.0  # smaller wall proximity band
-        self.near_goal_m = 20.0  # wider alignment/bonus band
-        self.align_k = 0.5  # stronger alignment reward near goal
-        self.safe_spacing_m = 2.0  # smaller spacing radius indoors
-        self.spacing_scale = 0.7  # gentler spacing penalty
-        self.success_radius_m = 1.5  # tighter success radius indoors
+        self.shaping_k = 3.0  # reduced from 5.0 for more stable learning
+        self.vertical_shaping_k = 0.3  # reduced from 0.5 for gentler altitude shaping
+        self.time_penalty = 0.001  # reduced from 0.007 to prevent penalty accumulation
+        self.soft_wall_scale = 0.05  # reduced from 0.2 for much gentler wall penalty
+        self.soft_wall_radius = 5.0  # reduced from 8.0 for smaller penalty zone
+        self.near_goal_m = 25.0  # increased from 20.0 for wider positive zone
+        self.align_k = 1.0  # increased from 0.5 for stronger positive shaping
+        self.safe_spacing_m = 1.5  # reduced from 2.0 for tighter formation
+        self.spacing_scale = 0.3  # reduced from 0.7 for gentler spacing penalty
+        self.success_radius_m = 2.0  # legacy proximity success (kept for shaping)
+        # Require landing within target perimeter for final success
+        self.require_landing_for_success = True
+        self.landing_radius_m = 2.0  # XY radius around target for successful landing
+        # Fixed high-altitude discouragement in NED (more negative z = higher)
+        self.altitude_threshold_z = -3.0  # penalize when flying above 3 meters
+        self.altitude_penalty_per_meter = 5.0  # 5x stronger penalty per meter to discourage high flying
         # Optional per-agent formation offsets in world frame (x,y,z)
         # Defaults to zero offset for all agents
         self.agent_offsets = {}
@@ -201,12 +209,11 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         self.max_lidar_points = 2048
         self._lidar_sensor_names = ["LidarSensor1", "Lidar1", "Lidar", "lidar", "LidarSensor"]
 
-        # Geofence (indoor-friendly). XY matches target boundary; Z in NED (negative up)
-        # Smaller movement space for smaller map
+        # Geofence (indoor-friendly). XY matches target boundary; Z clamp disabled for debugging
         self.x_min, self.x_max = -150.0, 150.0
         self.y_min, self.y_max = -245.0, 100.0
-        # Slightly relax z_max to avoid constant clamping when hovering
-        self.z_min, self.z_max = -2.0, -0.5  # fly close to floor
+        # Z clamp enabled - limit height to reasonable indoor flying range
+        self.z_min, self.z_max = -5.0, -0.5  # Limit height to 0.5-5 meters
 
         # Track geofence hits per agent for hard penalties
         self._hit_geofence = {i: False for i in self.possible_agents}
@@ -218,13 +225,94 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         
         # Setup flight and set seed
         self.setup_flight()
+        
+        # CRITICAL: Arm all drones before accepting commands
+        self._arm_all_drones()
+        
         self._seed(42)
+        
+        # (Debug env self-test removed to speed up training; rely on logs instead)
 
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
     def action_space(self, agent):
         return self.action_spaces[agent]
+
+    def _arm_all_drones(self):
+        """Arm all drones so they can accept movement commands"""
+        if self.debug:
+            print("🔧 Arming all drones...")
+        
+        # Ensure simulator is running (not paused)
+        try:
+            self.drone.simPause(False)
+        except Exception:
+            pass
+
+        for drone_name in self.possible_agents:
+            try:
+                # Check current state
+                state = self.drone.getMultirotorState(drone_name)
+                if self.debug:
+                    print(f"  {drone_name}: Ready={state.ready}")
+                
+                # Arm the drone if not already armed
+                if not state.ready:
+                    if self.debug:
+                        print(f"  Arming {drone_name}...")
+                    
+                    try:
+                        # Enable API control first
+                        self.drone.enableApiControl(True, vehicle_name=drone_name)
+                        
+                        # Wait for API control to take effect
+                        import time
+                        time.sleep(0.2)
+                        
+                        # Arm the drone
+                        self.drone.armDisarm(True, vehicle_name=drone_name)
+                        
+                        # Takeoff and short hover to engage motors and confirm off ground
+                        self.drone.takeoffAsync(vehicle_name=drone_name).join()
+                        time.sleep(0.3)
+                        self.drone.moveToZAsync(-1.2, 1.0, vehicle_name=drone_name).join()
+                        time.sleep(0.3)
+                        
+                        # Verify arming
+                        new_state = self.drone.getMultirotorState(drone_name)
+                        is_flying = (new_state.landed_state != airsim.LandedState.Landed)
+                        if self.debug:
+                            print(f"  {drone_name}: Ready={new_state.ready}, Flying={is_flying}")
+                        
+                        if new_state.ready or is_flying:
+                            print(f"  ✓ {drone_name} armed successfully")
+                        else:
+                            print(f"  ❌ {drone_name} failed to arm!")
+                            # Try one more time
+                            self.drone.armDisarm(True, vehicle_name=drone_name)
+                            time.sleep(0.5)
+                            final_state = self.drone.getMultirotorState(drone_name)
+                            if final_state.ready or (final_state.landed_state != airsim.LandedState.Landed):
+                                print(f"  ✓ {drone_name} armed on second attempt!")
+                            else:
+                                print(f"  ❌ {drone_name} still not armed after retry!")
+                                
+                    except Exception as arm_error:
+                        if self.debug:
+                            print(f"    Arming error: {arm_error}")
+                        print(f"  ❌ {drone_name} failed to arm!")
+                        
+                else:
+                    if self.debug:
+                        print(f"  ✓ {drone_name} already armed")
+                        
+            except Exception as e:
+                if self.debug:
+                    print(f"  ❌ Error arming {drone_name}: {e}")
+        
+        if self.debug:
+            print("🔧 Drone arming complete")
 
     def _seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -243,6 +331,12 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
             missing = [i for i in self.agents if i not in action]
             if missing:
                 print("Missing actions for:", missing, "-> using last_action fallback")
+        
+        # Debug: show action values occasionally
+        if self.debug and isinstance(action, dict):
+            for agent_id, agent_action in action.items():
+                if np.random.random() < 0.05:  # 5% of the time
+                    print(f"DEBUG {agent_id} action: {agent_action}")
 
         # Execute actions for active agents; default to last smoothed action if missing
         for i in self.agents:
@@ -255,12 +349,20 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         # PettingZoo agent list update (avoid '__all__')
         self.agents = [k for k in self.possible_agents if self.terminations.get(k, 0) != 1]
 
+        # Always include '__all__' to help RLlib episode accounting
+        try:
+            self.terminations['__all__'] = all(self.terminations.get(a, 0) == 1 for a in self.possible_agents)
+            self.truncations['__all__'] = all(self.truncations.get(a, 0) == 1 for a in self.possible_agents)
+        except Exception:
+            pass
+
         if self.debug:
-        print("##################################")
-        print("########### Step debug ###########")
-        print("##################################")
-        print("Returned rewards", self.reward)
-        print("Active agents (not dead/not success):", self.agents)
+            print("##################################")
+            print("########### Step debug ###########")
+            print("##################################")
+            print(f"Episode idx: {self._episode_index} | Env step: {self.current_step}")
+            print("Returned rewards", self.reward)
+            print("Active agents (not dead/not success):", self.agents)
             print("Terminated?", self.terminations)
         # Filter infos to only current obs keys to satisfy RLlib
         info_filtered = {k: info[k] for k in obs.keys()}
@@ -293,10 +395,23 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         return self.get_obs(self.terminations)
 
     def generate_pos(self):
-        # Exact spawn points only
+        # If no spawn_points provided or set to 'here', keep current map positions
         xs, ys, zs = [], [], []
-        if self.spawn_points is None:
-            raise ValueError("spawn_points must be provided as dict or list of (x,y,z) for each agent")
+        if (self.spawn_points is None) or (
+            isinstance(self.spawn_points, str) and str(self.spawn_points).lower() in ("here", "current", "map")
+        ):
+            for aid in self.possible_agents:
+                try:
+                    st = self.drone.getMultirotorState(aid)
+                    cx = float(np.clip(st.kinematics_estimated.position.x_val, self.x_min, self.x_max))
+                    cy = float(np.clip(st.kinematics_estimated.position.y_val, self.y_min, self.y_max))
+                    cz = float(np.clip(st.kinematics_estimated.position.z_val, self.z_min, self.z_max))
+                except Exception:
+                    cx, cy, cz = 0.0, 0.0, -1.2
+                xs.append(cx); ys.append(cy); zs.append(cz)
+            return (np.array(xs, dtype=np.float32), np.array(ys, dtype=np.float32), np.array(zs, dtype=np.float32))
+
+        # Exact spawn points provided
         def _get_point(idx, aid):
             sp = self.spawn_points
             if isinstance(sp, dict):
@@ -314,27 +429,6 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
             cz = float(np.clip(pt[2], self.z_min, self.z_max))
             xs.append(cx); ys.append(cy); zs.append(cz)
         return (np.array(xs, dtype=np.float32), np.array(ys, dtype=np.float32), np.array(zs, dtype=np.float32))
-        res = True
-        while res:
-            y_center = getattr(self, '_spawn_center_y', 0.0)
-            # Bias spawn toward increasing Y to keep inside walls and reduce opposite starts
-            y_low = max(self.y_min + 5.0, y_center + 10.0)
-            y_high = min(self.y_max - 5.0, y_center + 40.0)
-            if y_low >= y_high:
-                y_low, y_high = self.y_min + 5.0, self.y_max - 5.0
-            y = np.random.uniform(y_low, y_high, self.num)
-            z_low = max(self.z_min, -1.2)
-            z_high = min(self.z_max, -0.9)
-            if z_low >= z_high:
-                z_low, z_high = self.z_min, self.z_max
-            z = np.random.uniform(z_low, z_high, self.num)
-            y_combos = combinations(y, 2)
-            y_diff = [a-b for a,b in y_combos]
-            if all(ele < -5 or ele > 5 for ele in y_diff):
-                res = False
-        x_val = float(getattr(self, 'agent_start_pos', 0.0))
-        x = np.full(self.num, x_val, dtype=np.float32)
-        return x, y, z
 
     # Multi agent start setup
     def setup_flight(self):
@@ -371,7 +465,7 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
             time.sleep(0.5)
             
             # Take off to a low hover near ground but away from z_max clamp
-            self.drone.moveToZAsync(-1.3, 1.0, vehicle_name=i).join()
+            self.drone.moveToZAsync(-0.8, 1.0, vehicle_name=i).join()
 
         # Set target pose from scene object and derive a start x slightly behind it
         # NOTE: Change object name here if your target differs
@@ -379,8 +473,8 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         # Clamp target inside geofence to ensure reachability
         tx = float(np.clip(x_t, self.x_min + 5.0, self.x_max - 5.0))
         ty = float(np.clip(y_t, self.y_min + 5.0, self.y_max - 5.0))
-        # Desired Z is 2 meters above the cube (AirSim NED: up is negative)
-        tz = float(z_t - 2.0)
+        # Desired Z is at the same height as the cube (AirSim NED: up is negative)
+        tz = float(z_t)
         # 2D legacy target (kept for compatibility in logs)
         self.target_pos = np.array([tx, ty])
         # 3D base goal position
@@ -393,32 +487,44 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
 
         # Generate deterministic or constrained spawn positions
         x_pos, y_pos, z_pos = self.generate_pos()
+        using_here_spawn = (self.spawn_points is None) or (
+            isinstance(self.spawn_points, str) and str(self.spawn_points).lower() in ("here", "current", "map")
+        )
 
         print("Starting y positions:", y_pos)
 
-        # Enforce minimum start–target XY distance to avoid instant terminations
-        min_start_target_xy = 5.0
-        tx, ty = float(self.target_pos[0]), float(self.target_pos[1])
-        for i in range(self.num):
-            # resample y until far enough in XY from target
-            tries = 0
-            while True:
-                dx = float(self.agent_start_pos) - tx
-                dy = float(y_pos[i]) - ty
-                if (dx * dx + dy * dy) ** 0.5 >= min_start_target_xy:
-                    break
-                # re-sample y
-                y_pos[i] = float(np.random.uniform(-50, 10))
-                tries += 1
-                if tries > 20:
-                    # give up; shift by min distance along y
-                    sign = 1.0 if dy >= 0 else -1.0
-                    y_pos[i] = ty + sign * min_start_target_xy
-                    break
+        # Enforce minimum start–target XY distance only when we actively place spawns
+        if not using_here_spawn:
+            min_start_target_xy = 5.0
+            tx, ty = float(self.target_pos[0]), float(self.target_pos[1])
+            for i in range(self.num):
+                tries = 0
+                while True:
+                    dx = float(self.agent_start_pos) - tx
+                    dy = float(y_pos[i]) - ty
+                    if (dx * dx + dy * dy) ** 0.5 >= min_start_target_xy:
+                        break
+                    # re-sample y
+                    y_pos[i] = float(np.random.uniform(-50, 10))
+                    tries += 1
+                    if tries > 20:
+                        # give up; shift by min distance along y
+                        sign = 1.0 if dy >= 0 else -1.0
+                        y_pos[i] = ty + sign * min_start_target_xy
+                        break
 
-        for i in range(0,self.num):
-            pose = airsim.Pose(airsim.Vector3r(float(x_pos[i]), float(y_pos[i]), float(z_pos[i])))
-            self.drone.simSetVehiclePose(pose=pose, ignore_collision=True, vehicle_name=self.possible_agents[i])
+        # Move agents to spawn only when explicit spawn points are provided
+        if not using_here_spawn:
+            for i in range(0,self.num):
+                try:
+                    self.drone.moveToPositionAsync(
+                        float(x_pos[i]), float(y_pos[i]), float(z_pos[i]),
+                        velocity=1.0, vehicle_name=self.possible_agents[i]
+                    ).join()
+                except Exception:
+                    # fallback if backend requires pose set during initialization only
+                    pose = airsim.Pose(airsim.Vector3r(float(x_pos[i]), float(y_pos[i]), float(z_pos[i])))
+                    self.drone.simSetVehiclePose(pose=pose, ignore_collision=True, vehicle_name=self.possible_agents[i])
 
         # Removed unused self.target_dist_prev
 
@@ -435,9 +541,16 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         self._prev_pos = {}
         self._desired_pos = {}
         self._initial_target_dist = {}
+        # Disable body-frame long-dt warmup steps; train straight without special debug steps
+        self._bf_debug_steps_remaining = {i: 0 for i in self.possible_agents}
         for i in self.possible_agents:
             try:
-                x_i, y_i, z_i = self.drone.simGetVehiclePose(i).position
+                st = self.drone.getMultirotorState(i)
+                x_i, y_i, z_i = (
+                    float(st.kinematics_estimated.position.x_val),
+                    float(st.kinematics_estimated.position.y_val),
+                    float(st.kinematics_estimated.position.z_val),
+                )
             except Exception:
                 x_i, y_i, z_i = 0.0, 0.0, 0.0
             # Desired 3D position for agent i
@@ -452,57 +565,132 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
 
 
     def do_action(self, action, name):
-        # Exponential smoothing
+        # Apply action smoothing
         prev = self._last_action[name]
         act = np.asarray(action, dtype=np.float32)
         act = np.clip(act, -1.0, 1.0)
+        # Slightly lower smoothing for quicker response
         smoothed = self.smooth_alpha * prev + (1.0 - self.smooth_alpha) * act
         self._last_action[name] = smoothed
+        
 
-        # Map to physical commands
+        # Map to physical commands (no extra velocity low-pass)
         vx = float(smoothed[1] * self.max_xy_speed)   # forward/back in body frame
         vy = float(smoothed[0] * self.max_xy_speed)   # left/right in body frame
         # AirSim NED: positive z is downward; positive action[2] should mean up -> invert sign
         vz = float(-smoothed[2] * self.max_z_speed)
-        yaw_rate = float(smoothed[3] * self.max_yaw_rate_deg)
+        # Zero yaw during first few episodes to avoid spirals
+        if self._episode_index < 5:
+            yaw_rate = 0.0
+        else:
+            yaw_rate = float(smoothed[3] * self.max_yaw_rate_deg)
 
         # Optional latency
         # No artificial latency in fast sim mode
 
         # Execute velocity and yaw concurrently for control_dt
         try:
-            f1 = self.drone.moveByVelocityBodyFrameAsync(vx, vy, vz, duration=self.control_dt, vehicle_name=name)
-            f2 = self.drone.rotateByYawRateAsync(yaw_rate, duration=self.control_dt, vehicle_name=name)
-            f1.join(); f2.join()
-        except Exception:
-            # Fallback without yaw control
-            self.drone.moveByVelocityBodyFrameAsync(vx, vy, vz, duration=self.control_dt, vehicle_name=name).join()
+            # Measure BEFORE, then command, then measure AFTER over the same duration
+            st_pre = self.drone.getMultirotorState(name)
+            pos_before = np.array([
+                float(st_pre.kinematics_estimated.position.x_val),
+                float(st_pre.kinematics_estimated.position.y_val),
+                float(st_pre.kinematics_estimated.position.z_val),
+            ])
 
-        # Post-action geofence clamp: keep within bounds, zero velocity on hit
+            # For the first N steps use longer dt and zero/low yaw in one combined BODY-frame command
+            if self._bf_debug_steps_remaining.get(name, 0) > 0:
+                dt_debug = 3.0
+                f1 = self.drone.moveByVelocityBodyFrameAsync(
+                    vx, vy, vz,
+                    duration=dt_debug,
+                    drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                    yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=0.0),
+                    vehicle_name=name,
+                )
+                f1.join()
+                effective_dt = dt_debug
+                self._bf_debug_steps_remaining[name] = self._bf_debug_steps_remaining.get(name, 0) - 1
+            else:
+                f1 = self.drone.moveByVelocityBodyFrameAsync(
+                    vx, vy, vz,
+                    duration=self.control_dt,
+                    drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
+                    yaw_mode=airsim.YawMode(is_rate=True, yaw_or_rate=yaw_rate),
+                    vehicle_name=name,
+                )
+                f1.join()
+                effective_dt = float(self.control_dt)
+
+            if self.debug:
+                st_post = self.drone.getMultirotorState(name)
+                pos_after = np.array([
+                    float(st_post.kinematics_estimated.position.x_val),
+                    float(st_post.kinematics_estimated.position.y_val),
+                    float(st_post.kinematics_estimated.position.z_val),
+                ])
+
+                movement = np.linalg.norm(pos_after - pos_before)
+                # Rotate body-frame velocity into NED to compute apples-to-apples expected displacement
+                q = st_pre.kinematics_estimated.orientation
+                w, xq, yq, zq = float(q.w_val), float(q.x_val), float(q.y_val), float(q.z_val)
+                R = np.array([
+                    [1 - 2*(yq*yq + zq*zq),     2*(xq*yq - zq*w),     2*(xq*zq + yq*w)],
+                    [    2*(xq*yq + zq*w), 1 - 2*(xq*xq + zq*zq),     2*(yq*zq - xq*w)],
+                    [    2*(xq*zq - yq*w),     2*(yq*zq + xq*w), 1 - 2*(xq*xq + yq*yq)],
+                ], dtype=np.float32)
+                v_body = np.array([vx, vy, vz], dtype=np.float32)
+                v_ned = R @ v_body
+                expected_movement = float(np.linalg.norm(v_ned)) * float(effective_dt)
+
+             
+                print(f"DEBUG {name}: Actual movement: {movement:.6f}, Expected: {expected_movement:.6f}")
+
+                if movement < 0.001 and expected_movement > 0.01:
+                    if name in self.agents and self.terminations.get(name, 0) != 1:
+                        print(f"⚠️  WARNING {name}: Commands sent but NO MOVEMENT detected!")
+                        print(f"  This suggests AirSim commands are failing silently!")
+                        print(f"  Drone status: Active, Ready={self.drone.getMultirotorState(name).ready}")
+                    else:
+                        print(f"ℹ️  {name}: No movement expected (drone terminated or inactive)")
+                
+        except Exception as e:
+            # Fallback without yaw control
+            if self.debug:
+                print(f"ERROR {name}: Command failed: {e}")
+            try:
+                self.drone.moveByVelocityBodyFrameAsync(vx, vy, vz, duration=self.control_dt, vehicle_name=name).join()
+            except Exception as e2:
+                if self.debug:
+                    print(f"ERROR {name}: Fallback command also failed: {e2}")
+                    print(f"  CRITICAL: AirSim is not responding to any commands!")
+
+        # Post-action geofence check in NED; avoid UE-world teleports
         try:
-            px, py, pz = self.drone.simGetVehiclePose(name).position
-            clamped_x = float(np.clip(px, self.x_min, self.x_max))
-            clamped_y = float(np.clip(py, self.y_min, self.y_max))
-            clamped_z = float(np.clip(pz, self.z_min, self.z_max))
-            if (abs(clamped_x - px) > 1e-3) or (abs(clamped_y - py) > 1e-3) or (abs(clamped_z - pz) > 1e-3):
-                pose = airsim.Pose(airsim.Vector3r(clamped_x, clamped_y, clamped_z))
-                self.drone.simSetVehiclePose(pose=pose, ignore_collision=True, vehicle_name=name)
-                # Damp smoothed action to avoid pushing against wall/ceiling, but allow recovery
+            st = self.drone.getMultirotorState(name)
+            px = float(st.kinematics_estimated.position.x_val)
+            py = float(st.kinematics_estimated.position.y_val)
+            pz = float(st.kinematics_estimated.position.z_val)
+            clamp_x = float(np.clip(px, self.x_min, self.x_max))
+            clamp_y = float(np.clip(py, self.y_min, self.y_max))
+            clamp_z = pz  # do not clamp Z during debugging
+            if (abs(clamp_x - px) > 1e-3) or (abs(clamp_y - py) > 1e-3) or (abs(clamp_z - pz) > 1e-3):
+                # Mark geofence and gently nudge back using NED velocity
                 self._last_action[name] *= 0.3
                 self._hit_geofence[name] = True
-                # Nudge away from wall by adding a small bias opposite to the clamped axis
-                nudge = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-                if clamped_x in (self.x_min, self.x_max):
-                    nudge[0] = -0.2 if clamped_x == self.x_max else 0.2
-                if clamped_y in (self.y_min, self.y_max):
-                    nudge[1] = -0.2 if clamped_y == self.y_max else 0.2
-                # apply a brief nudge in body frame forward direction to re-enter
+                nx = -0.3 if clamp_x != px and px > clamp_x else (0.3 if clamp_x != px and px < clamp_x else 0.0)
+                ny = -0.3 if clamp_y != py and py > clamp_y else (0.3 if clamp_y != py and py < clamp_y else 0.0)
+                # Keep altitude unchanged for nudge
                 try:
-        self.drone.moveByVelocityBodyFrameAsync(
-                        float(nudge[1]), float(nudge[0]), 0.0, duration=0.2, vehicle_name=name
-                    ).join()
+                    self.drone.moveByVelocityAsync(nx, ny, 0.0, duration=0.2, vehicle_name=name).join()
                 except Exception:
                     pass
+                # If altitude is out of bounds, correct it explicitly to avoid repeated clamps
+                if abs(clamp_z - pz) > 1e-3:
+                    try:
+                        self.drone.moveToZAsync(clamp_z, 1.0, vehicle_name=name).join()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -519,7 +707,12 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         self._depth_cache = {}
         for agent_id in self.possible_agents:
             try:
-                x, y, z = self.drone.simGetVehiclePose(agent_id).position
+                st = self.drone.getMultirotorState(agent_id)
+                x, y, z = (
+                    float(st.kinematics_estimated.position.x_val),
+                    float(st.kinematics_estimated.position.y_val),
+                    float(st.kinematics_estimated.position.z_val),
+                )
                 pos_all[agent_id] = (x, y, z)
             except Exception:
                 pos_all[agent_id] = (0.0, 0.0, 0.0)
@@ -576,15 +769,6 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
                     pos_low = self.observation_spaces[i]["pos"].low
                     pos_high = self.observation_spaces[i]["pos"].high
                     obs[i]['pos'] = np.clip(pos_vec, pos_low, pos_high)
-                    # Separate depth channel
-                    d_sep = self._depth_cache.get(i)
-                    if d_sep is None:
-                        d_sep = self.get_depth_image(thresh=1.5, name=i)
-                    if d_sep.shape[:2] != (self.image_shape[0], self.image_shape[1]):
-                        d_sep = cv2.resize(d_sep, (self.image_shape[1], self.image_shape[0]))
-                    d_sep = np.clip(d_sep, 0.0, 1.5)
-                    d_sep_u8 = ((d_sep / 1.5) * 255.0).astype(np.uint8)
-                    obs[i]['depth'] = np.expand_dims(d_sep_u8, axis=2)
                     # Provide separate depth channel (HxWx1, uint8 0..255)
                     d_sep = self._depth_cache.get(i)
                     if d_sep is None:
@@ -645,7 +829,7 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
                 depth = ((depth/3.4)*255).astype(int)
 
         if self.debug:
-        for i in obs:
+            for i in obs:
                 print("Position of", i, ":", obs[i]["pos"])        
         return obs, local_info
     # Multi agent reward
@@ -653,65 +837,79 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         coord = {}
 
         if self.current_step >= self.max_steps:
-            # Distance-proportional timeout penalty per agent:
-            # r_timeout_i = -100 * (current_distance / initial_distance)
+            # GENTLE timeout penalty per agent (reduced from -100 to -20)
             reward = {}
             for i in self.possible_agents:
                 try:
-                    x_i, y_i, z_i = self.drone.simGetVehiclePose(i).position
+                    pos_obj = self.drone.simGetVehiclePose(i).position
+                    x_i, y_i, z_i = float(pos_obj.x_val), float(pos_obj.y_val), float(pos_obj.z_val)
                 except Exception:
                     x_i, y_i, z_i = 0.0, 0.0, 0.0
                 desired = self._desired_pos.get(i, self._goal_base_pos)
                 curr = float(np.linalg.norm(np.array([x_i, y_i, z_i]) - desired))
                 init = float(max(1e-6, self._initial_target_dist.get(i, curr)))
-                reward[i] = -100.0 * (curr / init)
+                reward[i] = -20.0 * (curr / init)  # Much gentler timeout penalty
             terminations = {i: 1 for i in self.possible_agents}
             self.truncations = {i: 1 for i in self.possible_agents}     
             self.obj = {i: -1 for i in self.possible_agents}
             return reward, terminations
 
-        # Precompute current 3D distances and potential-based progress for all active agents
+        # Precompute current 3D distances for all active agents
         curr_dist = {}
-        prog = {}
         for i in self.agents:
-            x_i, y_i, z_i = self.drone.simGetVehiclePose(i).position
+            st = self.drone.getMultirotorState(i)
+            x_i, y_i, z_i = (
+                float(st.kinematics_estimated.position.x_val),
+                float(st.kinematics_estimated.position.y_val),
+                float(st.kinematics_estimated.position.z_val),
+            )
             desired = self._desired_pos.get(i, self._goal_base_pos)
             d = float(np.linalg.norm(np.array([x_i, y_i, z_i]) - desired))
             curr_dist[i] = d
-            prev = self._prev_target_dist.get(i, d)
-            # Potential-based shaping: k*(prev - gamma*curr)
-            prog[i] = prev - self.gamma * d
 
-        team_progress = sum(prog.values()) if prog else 0.0
+        # Calculate team progress (only positive values)
+        team_progress = 0.0
+        for i in self.agents:
+            prev = self._prev_target_dist.get(i, curr_dist[i])
+            progress = prev - curr_dist[i]  # Positive = getting closer
+            team_progress += max(0, progress)  # Only count positive progress
 
         for i in self.agents:
             if terminations[i] != 1:
                 reward[i] = 0
 
-                # Get agent position
-                x,y,z = self.drone.simGetVehiclePose(i).position
+                # Get agent position - CONVERT Vector3r to floats to avoid type errors
+                st = self.drone.getMultirotorState(i)
+                x, y, z = (
+                    float(st.kinematics_estimated.position.x_val),
+                    float(st.kinematics_estimated.position.y_val),
+                    float(st.kinematics_estimated.position.z_val),
+                )
                 #y += int(i[-1])*2 # AirSim BUG: spawn offset must be considered! 
                 coord[i] = (x,y,z)
 
-                # Progress-based reward (3D, potential-based) and proximity shaping
+                # 🍭 CLEAN CANDY-FIRST REWARD: Simple progress toward goal
                 target_dist_curr = curr_dist[i]
-                progress_pb = prog[i]
-                reward[i] += self.shaping_k * progress_pb
-                # Extra altitude shaping specifically toward desired Z
-                desired = self._desired_pos.get(i, self._goal_base_pos)
-                alt_err_prev = abs(self._prev_pos[i][2] - desired[2])
-                alt_err_curr = abs(z - desired[2])
-                reward[i] += self.vertical_shaping_k * (alt_err_prev - self.gamma * alt_err_curr)
-                # Proximity shaping: positive reward when within 20m (3D)
-                if target_dist_curr < 50.0:
-                    reward[i] += 0.2 * (50.0 - target_dist_curr)
-                # Small shared team-progress bonus
-                reward[i] += 0.3 * (team_progress / max(1, len(self.agents)))
+                
+                # SIMPLE PROGRESS: Reward for getting closer to goal (no double-rewarding!)
+                prev_dist = self._prev_target_dist.get(i, target_dist_curr)
+                progress = prev_dist - target_dist_curr  # Positive = getting closer
+                reward[i] += 30.0 * progress  # Strong but not overwhelming
+                
+                # PROXIMITY BONUS: Extra reward when very close to goal
+                if target_dist_curr < 10.0:
+                    reward[i] += 15.0  # Significant bonus for being close
+                elif target_dist_curr < 25.0:
+                    reward[i] += 5.0   # Moderate bonus
+                
+                # INDIVIDUAL TEAM BONUS: Only reward positive team progress
+                team_progress_positive = max(0, team_progress)  # Clip negative values
+                reward[i] += 0.5 * (team_progress_positive / max(1, len(self.agents)))
 
-                # Moving-away: disable separate penalty (covered by potential shaping)
+                # Moving-away: disable separate penalty (covered by progress reward)
                 self._away_steps[i] = 0
 
-                # Soft-wall penalty near geofence to discourage straight exits
+                # 🧱 GENTLE WALL LEARNING: Small penalties that teach without overwhelming
                 edge = min(
                     x - self.x_min,
                     self.x_max - x,
@@ -721,43 +919,44 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
                 soft = self.soft_wall_radius
                 if edge < soft:
                     frac = (soft - edge) / soft
-                    # Proximity penalty grows as we approach wall (rebalanced, softer)
-                    reward[i] -= self.soft_wall_scale * (soft - edge)
-                    # Extra penalty for high horizontal speed near wall
-                    if len(act[i]) >= 2:
+                    # GENTLE wall proximity penalty (much smaller)
+                    reward[i] -= 0.1 * (soft - edge)  # Reduced from 0.05 to 0.1, but still small
+                    
+                    # GENTLE speed penalty near walls (teaches "slow down near walls")
+                    if i in act and len(act[i]) >= 2:
                         horiz_mag = float(np.linalg.norm(np.array(act[i][0:2], dtype=np.float32)))
-                        reward[i] -= 0.1 * frac * horiz_mag
+                        reward[i] -= 0.02 * frac * horiz_mag  # Very small penalty
 
-                # Extra penalty on hard geofence hit (after clamping)
+                # Extra penalty on hard geofence hit (after clamping) - REDUCED
                 if self._hit_geofence.get(i, False):
-                    reward[i] -= 50.0
+                    reward[i] -= 10.0  # Reduced from 50.0 to 10.0 (gentle learning)
                     self._hit_geofence[i] = False
 
-                # Idle penalty: discourage staying still or yaw-spinning when far from goal
+                # 🕐 GENTLE IDLE LEARNING: Very small penalty for extended idling
                 try:
                     # Dynamic far threshold based on initial distance at reset (50%)
                     far_thresh = 0.5 * max(1e-6, self._initial_target_dist.get(i, target_dist_curr))
                     far = target_dist_curr > far_thresh
-                    forward_cmd = float(act[i][1]) if len(act[i]) >= 2 else 0.0
-                    lateral_cmd = float(act[i][0]) if len(act[i]) >= 1 else 0.0
-                    yaw_cmd = float(act[i][3]) if len(act[i]) >= 4 else 0.0
-                    translating = (abs(forward_cmd) > 0.05) or (abs(lateral_cmd) > 0.05) or (
-                        np.linalg.norm(np.array(act[i][0:2], dtype=np.float32)) > 0.15
-                    )
-                    yaw_spinning = abs(yaw_cmd) > 0.5
-                    if far and (not translating):
-                        self._idle_steps[i] = self._idle_steps.get(i, 0) + 1
-                        # Extra penalty when idling via yaw-only spinning
-                        if yaw_spinning:
-                            reward[i] -= 0.1
-                else:
-                        self._idle_steps[i] = 0
-                    if self._idle_steps[i] >= 5:
-                        reward[i] -= 0.3
+                    # Fix: act is a dict with agent names as keys
+                    if i in act:
+                        forward_cmd = float(act[i][1]) if len(act[i]) >= 2 else 0.0
+                        lateral_cmd = float(act[i][0]) if len(act[i]) >= 1 else 0.0
+                        yaw_cmd = float(act[i][3]) if len(act[i]) >= 4 else 0.0
+                        translating = (abs(forward_cmd) > 0.05) or (abs(lateral_cmd) > 0.05) or (
+                            np.linalg.norm(np.array(act[i][0:2], dtype=np.float32)) > 0.15
+                        )
+                        yaw_spinning = abs(yaw_cmd) > 0.5
+                        if far and (not translating):
+                            self._idle_steps[i] = self._idle_steps.get(i, 0) + 1
+                            # VERY GENTLE idle penalty (only after extended idling)
+                            if self._idle_steps[i] >= 25:  # Increased threshold even more
+                                reward[i] -= 0.01  # Tiny penalty (reduced from 0.05)
+                        else:
+                            self._idle_steps[i] = 0
                 except Exception:
                     pass
 
-                # Obstacle proximity penalty using forward depth (shorter range for small map)
+                # 🚧 GENTLE OBSTACLE LEARNING: Small penalties that teach obstacle avoidance
                 try:
                     # Reuse cached depth to avoid extra RPC
                     d_img = self._depth_cache.get(i)
@@ -770,28 +969,30 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
                         d_min = float(np.min(roi))
                         safe = 1.2
                         if d_min < safe:
-                            # Base penalty grows as we approach obstacle
-                            reward[i] -= 0.8 * (safe - d_min)
-                            # Extra when commanding forward
-                            if len(act[i]) >= 2 and float(act[i][1]) > 0:
-                                reward[i] -= 0.3 * float(act[i][1]) * (safe - d_min)
+                            # GENTLE obstacle penalty (much smaller)
+                            reward[i] -= 0.1 * (safe - d_min)  # Reduced from 0.8 to 0.1
+                            
+                            # GENTLE forward penalty near obstacles (teaches "slow down near obstacles")
+                            if i in act and len(act[i]) >= 2 and float(act[i][1]) > 0:
+                                reward[i] -= 0.05 * float(act[i][1]) * (safe - d_min)  # Reduced from 0.3 to 0.05
                 except Exception:
                     pass
 
-                # Smoothness penalties (vertical + yaw) — lighter
-                if len(act[i]) >= 3:
-                    reward[i] -= 0.1 * abs(float(act[i][2]))
-                if len(act[i]) >= 4:
-                    reward[i] -= 0.1 * abs(float(act[i][3]))
+                # 🎯 GENTLE SMOOTHNESS LEARNING: Very small penalties for jerky movements
+                # Fix: act is a dict with agent names as keys
+                if i in act and len(act[i]) >= 3:
+                    reward[i] -= 0.005 * abs(float(act[i][2]))  # Reduced from 0.02 to 0.005
+                if i in act and len(act[i]) >= 4:
+                    reward[i] -= 0.005 * abs(float(act[i][3]))  # Reduced from 0.02 to 0.005
 
-                # Time penalty per step (only when far from goal)
+                # ⏰ GENTLE TIME LEARNING: Very small time pressure (only when far from goal)
                 try:
                     far_thresh = 0.5 * max(1e-6, self._initial_target_dist.get(i, target_dist_curr))
                     if target_dist_curr > far_thresh and self.time_penalty > 0.0:
-                        reward[i] -= self.time_penalty
+                        reward[i] -= self.time_penalty * 0.1  # Reduce time penalty by 90%
                 except Exception:
                     if self.time_penalty > 0.0:
-                        reward[i] -= self.time_penalty
+                        reward[i] -= self.time_penalty * 0.1  # Reduce time penalty by 90%
 
                 # Heading/velocity alignment near goal
                 try:
@@ -815,33 +1016,96 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
                     self.obj[i] = -1
                     print(f"Termination reason for {i}: collision")
 
-                # Check success in 3D around desired offset point
-                if target_dist_curr < self.success_radius_m:
-                    reward[i] = 300
-                    terminations[i] = 1
-                    self.truncations[i] = 1
-                    self.obj[i] = 1
-                    print(f"Termination reason for {i}: success (within {self.success_radius_m}m 3D)")
+                # 🎉 SUCCESS requires LANDING within target XY perimeter (if enabled)
+                if self.require_landing_for_success:
+                    # Distance in XY to goal center
+                    goal_xy = self._desired_pos[i][:2]
+                    dist_xy = float(np.linalg.norm(np.array([x, y], dtype=np.float32) - goal_xy))
+                    landed = False
+                    try:
+                        st_now = self.drone.getMultirotorState(i)
+                        landed = (st_now.landed_state == airsim.LandedState.Landed)
+                    except Exception:
+                        pass
+                    if dist_xy < self.landing_radius_m and landed:
+                        reward[i] = 1000
+                        remaining = max(0, float(self.max_steps - self.current_step))
+                        bonus = 0.5 * (remaining / max(1.0, float(self.max_steps))) * 1000.0
+                        reward[i] += bonus
+                        terminations[i] = 1
+                        self.truncations[i] = 1
+                        self.obj[i] = 1
+                        print(f"🎉 {i} landed inside perimeter! +1000, Speed bonus: +{bonus:.1f}")
+                else:
+                    # Legacy proximity-only success (kept as fallback)
+                    if target_dist_curr < self.success_radius_m:
+                        reward[i] = 1000
+                        remaining = max(0, float(self.max_steps - self.current_step))
+                        bonus = 0.5 * (remaining / max(1.0, float(self.max_steps))) * 1000.0
+                        reward[i] += bonus
+                        terminations[i] = 1
+                        self.truncations[i] = 1
+                        self.obj[i] = 1
+                        print(f"🎉 {i} got the CANDY! Success: +1000, Speed bonus: +{bonus:.1f}")
+
+                # Add height penalty (encourage staying low)
+                if z < self.altitude_threshold_z:  # If flying too high
+                    height_penalty = abs(z - self.altitude_threshold_z) * self.altitude_penalty_per_meter
+                    reward[i] -= height_penalty
+                    if self.debug:
+                        print(f"⚠️ {i} flying too high (z={z:.1f}), penalty: -{height_penalty:.1f}")
+
+                # 🎯 PROGRESSIVE LANDING REWARDS: Encourage getting closer to goal progressively
+                goal_xy = self._desired_pos[i][:2]
+                dist_xy = float(np.linalg.norm(np.array([x, y], dtype=np.float32) - goal_xy))
+                
+                # Progressive proximity bonus (stronger as you get closer)
+                if dist_xy < self.landing_radius_m * 3:  # Within 3x landing radius (6m)
+                    proximity_bonus = (self.landing_radius_m * 3 - dist_xy) * 25  # 25 points per meter closer
+                    reward[i] += proximity_bonus
+                    if self.debug and proximity_bonus > 10:
+                        print(f"🎯 {i} near goal (dist={dist_xy:.1f}m), proximity bonus: +{proximity_bonus:.1f}")
+                
+                # Landing zone bonus (continuous reward while in landing zone)
+                if dist_xy < self.landing_radius_m:
+                    zone_bonus = 100  # 100 points per step while in landing zone
+                    reward[i] += zone_bonus
+                    if self.debug:
+                        print(f"🛬 {i} in landing zone (dist={dist_xy:.1f}m), zone bonus: +{zone_bonus}")
 
                 # Update previous position and distance memory at end of per-agent step
                 self._prev_target_dist[i] = target_dist_curr
                 self._prev_pos[i] = np.array([x, y, z], dtype=np.float32)
 
-        # Smooth inter-drone spacing shaping
+        # CONDITIONAL inter-drone spacing: Only penalize when far from goal
         if len(self.agents) > 1:
             for a_id, b_id in combinations(self.agents, 2):
                 d_ab = self.msd(coord[a_id], coord[b_id])
                 if d_ab < self.safe_spacing_m:
-                    penalty = self.spacing_scale * (self.safe_spacing_m - d_ab)
-                    reward[a_id] -= penalty
-                    reward[b_id] -= penalty
+                    # Only apply spacing penalty if drones are far from goal (avoid conflicts)
+                    a_dist = curr_dist.get(a_id, float('inf'))
+                    b_dist = curr_dist.get(b_id, float('inf'))
+                    
+                    if a_dist > 5.0 and b_dist > 5.0:  # Both drones far from goal
+                        penalty = self.spacing_scale * (self.safe_spacing_m - d_ab) * 0.5  # Reduced penalty
+                        reward[a_id] -= penalty
+                        reward[b_id] -= penalty
+                    # If close to goal, ignore spacing penalty to avoid conflicts
 
-        # Give another reward if all drones reach objective
+        # INDIVIDUAL + TEAM REWARDS: Reward individual success, not just team success
+        for i in self.agents:
+            if self.obj.get(i, 0) == 1:  # Individual success
+                reward[i] += 100  # Individual success bonus
+                print(f"🎉 {i} individual success bonus: +100")
+        
+        # Team bonuses (smaller than individual)
         if all([k==1 for k in self.obj.values()]):
-            reward = {k:v+200 for k,v in reward.items()}
+            for i in self.agents:
+                reward[i] += 50   # Smaller team bonus
             print("################### !!! ALL DRONES ARRIVED !!! ###################")
         elif all([k==-1 for k in self.obj.values()]):
-            reward = {k:v-200 for k,v in reward.items()}
+            for i in self.agents:
+                reward[i] -= 50   # Smaller team penalty
             print("################### ALL DRONES CRASHED :( ###################")
         # elif all([k==1 for k in self.done.values()]) and any([k==-1 for k in self.obj.values()]) and any([k==1 for k in self.obj.values()]): #try to give a negative reward for each collided proportion to their number and try to give a positive for each arrived
         #     neg = -100*(len([k for k in self.obj.values() if k==-1])/self.num)
@@ -850,10 +1114,9 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         #     reward = {k:v+tot for k,v in reward.items()}
         #     print("################### SOME ARRIVED, SOME CRUSHED ###################")
 
-        # Clip non-terminal per-step rewards to stabilize scale
-        for i in self.agents:
-            if terminations.get(i, 0) != 1:
-                reward[i] = float(np.clip(reward[i], -5.0, 5.0))
+        # NO MORE CLIPPING - Let natural reward scale work for proper learning
+        # The reward function is now designed to generate reasonable values naturally
+        # Clipping was destroying the reward signal differentiation!
 
         # Debug
         # print("############# Drone n.", i,"#############")
@@ -894,7 +1157,7 @@ class AirSimDroneEnv(ParallelEnv, EzPickle):
         depth_image_request = airsim.ImageRequest(
             1, airsim.ImageType.DepthPerspective, True, False)
         if name is None:
-        responses = self.drone.simGetImages([depth_image_request])
+            responses = self.drone.simGetImages([depth_image_request])
         else:
             responses = self.drone.simGetImages([depth_image_request], vehicle_name=name)
         # Some backends may return float64; cast to float32

@@ -86,6 +86,26 @@ class GNNPerAgentModelMAGNET(TorchModelV2, nn.Module):
         self.task_context_proj = nn.Linear(attn_dim, 128)
         self.fused_for_policy = nn.Linear(fused_dim + 128, fused_dim)
 
+        # Message-aware Q/K/V for peer comm (unified team_comm)
+        self.msg_key = nn.Linear(64, attn_dim)
+        self.msg_val = nn.Linear(64, attn_dim)
+        self.msg_query = nn.Linear(fused_dim, attn_dim)
+        # Project message context to fused_dim so pooled stays same size
+        self.msg_ctx_proj2 = nn.Linear(attn_dim, fused_dim)
+
+        # LiDAR fusion (quick path): encode 32-bin LiDAR and fuse into pooled via residual
+        self.lidar_mlp = nn.Sequential(
+            nn.Linear(32, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+        )
+        self.lidar_proj2 = nn.Linear(64, fused_dim)
+
+        # TTC fusion (self-safety context)
+        self.ttc_mlp = nn.Sequential(
+            nn.Linear(2, 32), nn.ReLU(),
+        )
+        self.ttc_proj = nn.Linear(32, fused_dim)
+
         # Continuous control head (same format as base): [mean, log_std]
         self.policy_head = nn.Sequential(
             nn.Linear(fused_dim, 256), nn.ReLU(),
@@ -140,7 +160,11 @@ class GNNPerAgentModelMAGNET(TorchModelV2, nn.Module):
         cam = obs.get("cam")
         pos = obs.get("pos")
         team_pos = obs.get("team_pos", None)
+        team_comm = obs.get("team_comm", None)                # (N,8) unified
+        team_comm_mask = obs.get("team_comm_mask", None)      # (N,)
+        lidar_bins = obs.get("lidar", None)                   # (32,)
         agent_idx = obs.get("agent_idx", None)
+        ttc = obs.get("ttc", None)
 
         # Camera tensor [B,C,H,W]
         if cam is None:
@@ -211,6 +235,23 @@ class GNNPerAgentModelMAGNET(TorchModelV2, nn.Module):
             rel_pos = pos_t.unsqueeze(1).float()
 
         cam_node = cam_feat.unsqueeze(1).expand(-1, N, -1)
+
+        # Message-aware features: encode team_comm per peer (for Q/K/V only)
+        msg_feat = None
+        if team_comm is not None:
+            if isinstance(team_comm, np.ndarray):
+                team_comm_t = th.as_tensor(team_comm, device=device).float()
+            else:
+                team_comm_t = team_comm.to(device).float()
+            if team_comm_t.dim() == 2:
+                team_comm_t = team_comm_t.unsqueeze(0)
+            msg_in = team_comm_t  # (B,N,8)
+            if not hasattr(self, "_msg_mlp"):
+                in_dim = msg_in.shape[-1]
+                self._msg_mlp = nn.Sequential(nn.Linear(in_dim, 64), nn.ReLU())
+                self._msg_mlp.to(device)
+            msg_feat = self._msg_mlp(msg_in)
+
         node_feats = th.cat([cam_node, rel_pos], dim=-1)
 
         if team_pos_t is not None:
@@ -219,6 +260,17 @@ class GNNPerAgentModelMAGNET(TorchModelV2, nn.Module):
             adj = th.ones((node_feats.shape[0], 1, 1), dtype=node_feats.dtype, device=node_feats.device)
         eye = th.eye(adj.shape[1], device=node_feats.device, dtype=node_feats.dtype).unsqueeze(0)
         adj = adj * (1 - eye)
+        # Optional hard validity gating: silence invalid senders before attention
+        if team_comm_mask is not None:
+            if isinstance(team_comm_mask, np.ndarray):
+                mask_t = th.as_tensor(team_comm_mask, device=device).float()
+            else:
+                mask_t = team_comm_mask.to(device).float()
+            if mask_t.dim() == 1:
+                mask_t = mask_t.unsqueeze(0)
+            # shape [B,1,N] broadcast over receivers
+            sender_mask = mask_t.unsqueeze(1)
+            adj = adj * sender_mask
         row_sums = adj.sum(dim=2)
         if row_sums.dim() == 2:
             need_self = (row_sums == 0).to(adj.dtype)
@@ -243,6 +295,41 @@ class GNNPerAgentModelMAGNET(TorchModelV2, nn.Module):
 
         fused = th.cat([h, id_emb.unsqueeze(1).expand(-1, h.shape[1], -1)], dim=-1)
         pooled = fused.mean(dim=1)  # per-agent embedding
+
+        # Per-peer message attention (Q/K/V) over local neighbors using message embeddings
+        if msg_feat is not None:
+            q_peer = self.msg_query(pooled).unsqueeze(1)        # (B,1,attn)
+            k_peer = self.msg_key(msg_feat)                     # (B,N,attn)
+            v_peer = self.msg_val(msg_feat)                     # (B,N,attn)
+            # Mask invalid senders
+            if team_comm_mask is not None:
+                if isinstance(team_comm_mask, np.ndarray):
+                    m = th.as_tensor(team_comm_mask, device=device).float()
+                else:
+                    m = team_comm_mask.to(device).float()
+                if m.dim() == 1:
+                    m = m.unsqueeze(0)
+                very_neg = th.finfo(q_peer.dtype).min / 2
+                logits = (q_peer * k_peer).sum(dim=-1)  # (B,N)
+                logits = logits.masked_fill(m < 0.5, very_neg)
+            else:
+                logits = (q_peer * k_peer).sum(dim=-1)
+            attn = th.softmax(logits, dim=-1).unsqueeze(-1)     # (B,N,1)
+            msg_ctx = (attn * v_peer).sum(dim=1)                # (B,attn)
+            # Fuse message context into pooled features (project to fused_dim)
+            pooled = pooled + self.msg_ctx_proj2(msg_ctx)
+        # LiDAR quick fusion (residual)
+        if lidar_bins is not None:
+            if isinstance(lidar_bins, np.ndarray):
+                lidar_t = th.as_tensor(lidar_bins, device=device).float()
+            else:
+                lidar_t = lidar_bins.to(device).float()
+            if lidar_t.dim() == 1:
+                lidar_t = lidar_t.unsqueeze(0)
+            lidar_feat = self.lidar_mlp(lidar_t)
+            # Reduce residual weight further and gate by a sigmoid to avoid dominance
+            lidar_ctx = th.sigmoid(self.lidar_proj2(lidar_feat))
+            pooled = pooled + 0.1 * lidar_ctx
 
         # MAGNNET task attention
         task_pos = obs.get("task_pos", None)
@@ -278,6 +365,18 @@ class GNNPerAgentModelMAGNET(TorchModelV2, nn.Module):
             ctx = (attn.unsqueeze(-1) * task_k).sum(dim=1)  # (B, attn_dim)
             ctx_proj = self.task_context_proj(ctx)          # (B, 128)
             fused_for_policy = th.relu(self.fused_for_policy(th.cat([pooled, ctx_proj], dim=-1)))
+
+        # Fuse TTC scalars into pooled (self-only safety context)
+        if ttc is not None:
+            if isinstance(ttc, np.ndarray):
+                ttc_t = th.as_tensor(ttc, device=device).float()
+            else:
+                ttc_t = ttc.to(device).float()
+            if ttc_t.dim() == 1:
+                ttc_t = ttc_t.unsqueeze(0)
+            # Simple bounded features then project
+            ttc_feat = th.clamp(ttc_t, 0.0, 100.0)
+            pooled = pooled + self.ttc_proj(self.ttc_mlp(ttc_feat))
 
         # Heads
         logits = self.policy_head(fused_for_policy)
